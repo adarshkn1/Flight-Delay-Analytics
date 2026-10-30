@@ -1,0 +1,12 @@
+2026-01	5.60 minutes | 19643 flights | 3982 delayed | 20.27%
+2026-02	9.03 minutes | 20682 flights | 4793 delayed | 23.17%
+2026-03	20.79 minutes | 19430 flights | 5419 delayed | 27.89%
+2026-04	13.37 minutes | 14626 flights | 3150 delayed | 21.54%
+2026-05	20.87 minutes | 19884 flights | 6348 delayed | 31.93%
+2026-06	26.17 minutes | 20115 flights | 6720 delayed | 33.41%
+2026-07	11.83 minutes | 19151 flights | 5030 delayed | 26.26%
+2026-08	4.38 minutes | 19763 flights | 3812 delayed | 19.29%
+2026-09	21.83 minutes | 20459 flights | 6404 delayed | 31.30%
+2026-10	18.88 minutes | 20722 flights | 6496 delayed | 31.35%
+2026-11	13.96 minutes | 18805 flights | 4940 delayed | 26.27%
+2026-12	18.49 minutes | 20595 flights | 6180 delayed | 30.01%

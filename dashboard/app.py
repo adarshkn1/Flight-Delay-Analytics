@@ -1,0 +1,502 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from pathlib import Path
+
+st.set_page_config(page_title="FlightScope | Delay Intelligence", page_icon="✈️", layout="wide", initial_sidebar_state="expanded")
+
+BASE = Path(__file__).resolve().parent.parent
+RESULTS = BASE / "results"
+AIRPORT_FILE = BASE / "data" / "airports_reference.csv"
+
+# ---------- Theme ----------
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=Space+Grotesk:wght@500;600;700&display=swap');
+:root { --ink:#e8edf7; --muted:#9ba8bd; --panel:#111a2b; --line:rgba(148,163,184,.16); --cyan:#39d5e8; --violet:#9b8cff; }
+html, body, [class*="css"] { font-family:'DM Sans',sans-serif; }
+.stApp { background: radial-gradient(ellipse at 15% 0%, rgba(58,83,150,.22), transparent 36%), linear-gradient(145deg,#080d18 0%,#0b1220 55%,#101629 100%); color:var(--ink); }
+[data-testid="stHeader"] { background:rgba(8,13,24,.75); }
+[data-testid="stSidebar"] { background:linear-gradient(180deg,#0d1525,#0a1020); border-right:1px solid var(--line); }
+[data-testid="stSidebar"] * { color:#dce6f7; }
+.block-container { padding-top:2rem; padding-bottom:3rem; max-width:1500px; }
+h1,h2,h3 { font-family:'Space Grotesk',sans-serif !important; letter-spacing:-.035em; }
+.hero { padding:26px 30px; border:1px solid rgba(105,144,210,.25); border-radius:22px; background:linear-gradient(115deg,rgba(31,54,91,.88),rgba(22,28,51,.82) 58%,rgba(50,40,91,.72)); box-shadow:0 18px 55px rgba(0,0,0,.22); margin-bottom:22px; }
+.hero-kicker { color:#8eeaf2; font-size:12px; font-weight:700; letter-spacing:.16em; text-transform:uppercase; }
+.hero-title { font-family:'Space Grotesk',sans-serif; font-size:clamp(28px,4vw,42px); line-height:1.12; font-weight:700; color:#f5f8ff; margin:8px 0; }
+.hero-sub { color:#b8c5dc; font-size:14px; }
+.section-kicker { color:#7ddce8; text-transform:uppercase; letter-spacing:.13em; font-size:11px; font-weight:700; margin:20px 0 5px; }
+div[data-testid="stMetric"] { background:linear-gradient(145deg,rgba(23,35,57,.95),rgba(16,25,42,.95)); border:1px solid var(--line); border-radius:17px; padding:17px 18px; box-shadow:0 10px 30px rgba(0,0,0,.12); }
+div[data-testid="stMetricLabel"] p { color:#aebbd0 !important; font-size:12px !important; }
+div[data-testid="stMetricValue"] { color:#f3f7ff !important; font-family:'Space Grotesk',sans-serif; }
+[data-testid="stPlotlyChart"] { background:rgba(15,24,41,.66); border:1px solid var(--line); border-radius:17px; padding:10px; }
+.stButton>button, .stDownloadButton>button { border-radius:10px; border:1px solid rgba(57,213,232,.35); background:linear-gradient(100deg,#15516a,#403b78); color:white; font-weight:600; }
+.stSelectbox>div>div, .stMultiSelect>div>div, .stSlider { background:rgba(18,29,48,.75); }
+[data-testid="stDataFrame"] { border:1px solid var(--line); border-radius:14px; overflow:hidden; }
+hr { border-color:var(--line); }
+.small-note { color:#9ba8bd; font-size:12px; }
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- Airport reference ----------
+AIRPORT_NAMES = {}
+if AIRPORT_FILE.exists():
+    ref = pd.read_csv(AIRPORT_FILE)
+    if {"iata_code", "airport_name"}.issubset(ref.columns):
+        ref = ref[["iata_code", "airport_name"]].dropna()
+        AIRPORT_NAMES = dict(zip(ref.iata_code.astype(str).str.strip(), ref.airport_name.astype(str).str.strip()))
+AIRPORT_NAMES.update({
+    "HEZ": "Natchez-Adams County Airport", "LAF": "Purdue University Airport",
+    "LNS": "Lancaster Airport", "VRB": "Vero Beach Regional Airport"
+})
+def airport_name(code):
+    code = str(code).strip()
+    return f"{AIRPORT_NAMES.get(code, 'Airport name unavailable')} ({code})"
+
+def style_fig(fig, height=390):
+    fig.update_layout(height=height, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="DM Sans", color="#dce6f7"), title_font=dict(size=17, color="#f3f7ff"),
+        margin=dict(l=18,r=18,t=58,b=35), legend_title_font_color="#cbd5e1",
+        xaxis=dict(gridcolor="rgba(148,163,184,.10)", zerolinecolor="rgba(148,163,184,.12)"),
+        yaxis=dict(gridcolor="rgba(148,163,184,.10)", zerolinecolor="rgba(148,163,184,.12)"))
+    return fig
+
+@st.cache_data
+def load_data():
+    def parse_average(file, key):
+        rows=[]
+        for line in (RESULTS/file).read_text().splitlines():
+            p=line.split()
+            if len(p)>=5:
+                try: rows.append({key:p[0],"average_delay":float(p[1]),"count":int(p[3].lstrip("("))})
+                except ValueError: pass
+        return pd.DataFrame(rows)
+    carrier=parse_average("carrier-average.txt","carrier")
+    airport=parse_average("airport-average.txt","airport")
+    rate_rows=[]
+    for line in (RESULTS/"airport-delay-rate.txt").read_text().splitlines():
+        p=line.split()
+        if len(p)>=5:
+            try:
+                n,d=p[3].strip("()").split("/")
+                rate_rows.append({"airport":p[0],"delay_rate":float(p[1].replace("%","")),"delayed":int(n),"total":int(d)})
+            except (ValueError,IndexError): pass
+    rate=pd.DataFrame(rate_rows)
+    causes=pd.read_csv(RESULTS/"delay-cause-totals.txt",sep=r"\s+",names=["cause","minutes"])
+    ac=pd.read_csv(RESULTS/"airport-delay-causes.txt",sep=r"\s+",names=["airport_cause","minutes"])
+    ac[["airport","cause"]]=ac.airport_cause.str.split("_",n=1,expand=True)
+    return carrier,airport,rate,causes,ac
+
+@st.cache_data
+def load_monthly_trends():
+    path = RESULTS / "monthly-trends.txt"
+    if not path.exists():
+        return pd.DataFrame(columns=["month", "average_delay", "flights", "delayed", "delay_rate"])
+    rows = []
+    for line in path.read_text().splitlines():
+        parts = line.split()
+        # Expected: YYYY-MM 5.60 minutes | 19643 flights | 3982 delayed | 20.27%
+        if len(parts) >= 11:
+            try:
+                rows.append({
+                    "month": parts[0],
+                    "average_delay": float(parts[1]),
+                    "flights": int(parts[4]),
+                    "delayed": int(parts[7]),
+                    "delay_rate": float(parts[10].replace("%", ""))
+                })
+            except (ValueError, IndexError):
+                continue
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df["month_date"] = pd.to_datetime(df["month"], format="%Y-%m", errors="coerce")
+        df["month_label"] = df["month_date"].dt.strftime("%b %Y")
+        df = df.sort_values("month_date")
+    return df
+
+
+@st.cache_data
+def load_route_analysis():
+    path = RESULTS / "route-analysis.txt"
+    rows = []
+    if not path.exists():
+        return pd.DataFrame(columns=["route", "average_delay", "flights", "delayed", "delay_rate"])
+    for line in path.read_text().splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        try:
+            avg, flights, delayed, rate_value = parts[1].split(",")
+            rows.append({"route": parts[0], "average_delay": float(avg), "flights": int(flights),
+                         "delayed": int(delayed), "delay_rate": float(rate_value)})
+        except (ValueError, IndexError):
+            continue
+    return pd.DataFrame(rows)
+
+
+@st.cache_data
+def load_cancellation_diversion():
+    path = RESULTS / "cancellation-diversion.txt"
+    rows = []
+    if not path.exists():
+        return pd.DataFrame(columns=["carrier", "flights", "cancelled", "cancellation_rate",
+                                     "diverted", "diversion_rate"])
+    for line in path.read_text().splitlines():
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            continue
+        try:
+            flights, cancelled, cancel_rate, diverted, divert_rate = parts[1].split(",")
+            rows.append({"carrier": parts[0], "flights": int(flights), "cancelled": int(cancelled),
+                         "cancellation_rate": float(cancel_rate), "diverted": int(diverted),
+                         "diversion_rate": float(divert_rate)})
+        except (ValueError, IndexError):
+            continue
+    return pd.DataFrame(rows)
+
+
+@st.cache_data
+def load_airport_coordinates():
+    if not AIRPORT_FILE.exists():
+        return pd.DataFrame(columns=["iata_code", "airport_name", "latitude", "longitude"])
+    ref = pd.read_csv(AIRPORT_FILE)
+    required = {"iata_code", "airport_name", "latitude", "longitude"}
+    if not required.issubset(ref.columns):
+        return pd.DataFrame(columns=["iata_code", "airport_name", "latitude", "longitude"])
+    ref = ref[["iata_code", "airport_name", "latitude", "longitude"]].copy()
+    ref["iata_code"] = ref["iata_code"].astype(str).str.strip()
+    ref["latitude"] = pd.to_numeric(ref["latitude"], errors="coerce")
+    ref["longitude"] = pd.to_numeric(ref["longitude"], errors="coerce")
+    return ref.dropna(subset=["latitude", "longitude"]).drop_duplicates("iata_code")
+
+try:
+    carrier, airport, rate, causes, airport_causes = load_data()
+    monthly = load_monthly_trends()
+    routes = load_route_analysis()
+    cancellation = load_cancellation_diversion()
+    airport_coordinates = load_airport_coordinates()
+except Exception as e:
+    st.error(f"Unable to load project result files: {e}")
+    st.info("Check that the results folder contains all five exported .txt files.")
+    st.stop()
+
+# ---------- Sidebar ----------
+st.sidebar.markdown("<div style='font-family:Space Grotesk;font-size:23px;font-weight:700'>✈️ Flight<span style='color:#39d5e8'>Scope</span></div><div style='color:#93a4bf;font-size:11px;letter-spacing:.12em;margin:3px 0 22px'>DELAY INTELLIGENCE PLATFORM</div>",unsafe_allow_html=True)
+pages={"◈  Overview":"Overview","▤  Carrier intelligence":"Carrier Analysis","⌖  Airport performance":"Airport Analysis","◉  Delay causes":"Delay Causes","✦  Smart insights":"Smart Insights","⇄  Airport comparison":"Airport Comparison","▥  Monthly trends":"Monthly Trend Analysis","⌁  Route intelligence":"Route Analysis","⚑  Cancellations & diversions":"Cancellation & Diversion"}
+choice=st.sidebar.radio("WORKSPACE",list(pages.keys()),label_visibility="visible")
+page=pages[choice]
+st.sidebar.divider()
+st.sidebar.caption("DATA PIPELINE")
+st.sidebar.markdown("**HDFS**  ·  **Java MapReduce**  ·  **YARN**")
+st.sidebar.markdown("**Python**  ·  **Streamlit**  ·  **Plotly**")
+used=set(airport.airport.dropna().astype(str)); missing=sorted(c for c in used if c not in AIRPORT_NAMES)
+st.sidebar.caption(f"Airport reference coverage: {len(used)-len(missing)}/{len(used)}")
+
+# ---------- Header ----------
+st.markdown(f"<div class='hero'><div class='hero-kicker'>FLIGHT OPERATIONS · DATA INTELLIGENCE</div><div class='hero-title'>{page}</div><div class='hero-sub'>Explore operational delay patterns across carriers, airports and delay categories — powered by distributed Hadoop processing.</div></div>",unsafe_allow_html=True)
+
+# ---------- Overview ----------
+if page=="Overview":
+    valid=carrier.dropna(subset=["average_delay"])
+    total=int(valid["count"].sum())
+    avg=float((valid.average_delay*valid["count"]).sum()/total) if total else 0
+    topc=valid.loc[valid.average_delay.idxmax()]
+    topcause=causes.loc[causes.minutes.idxmax()]
+    merged=airport.merge(rate,on="airport",how="inner")
+    topa=merged.loc[merged.delay_rate.idxmax()] if not merged.empty else None
+    st.markdown("<div class='section-kicker'>AT A GLANCE</div>",unsafe_allow_html=True)
+    k=st.columns(4)
+    k[0].metric("Flights analysed",f"{total:,}")
+    k[1].metric("Weighted avg. arrival delay",f"{avg:.2f} min")
+    k[2].metric("Carrier with highest avg. delay",topc.carrier,f"{topc.average_delay:.2f} min")
+    k[3].metric("Largest delay category",topcause.cause.replace("_"," ").title())
+    left,right=st.columns([1.35,1])
+    with left:
+        st.markdown("### Carrier delay landscape")
+        f=px.bar(valid.sort_values("average_delay"),x="average_delay",y="carrier",orientation="h",color="average_delay",text_auto=".1f",labels={"average_delay":"Average arrival delay (min)","carrier":"Carrier"})
+        st.plotly_chart(style_fig(f,420),width="stretch")
+    with right:
+        st.markdown("### Delay cause contribution")
+        c=causes.copy(); c["Cause"]=c.cause.str.replace("_"," ").str.title()
+        f=px.pie(c,names="Cause",values="minutes",hole=.58)
+        f.update_traces(textposition="inside",textinfo="percent+label")
+        st.plotly_chart(style_fig(f,420),width="stretch")
+    st.markdown("### Operational signal")
+    if topa is not None:
+        st.info(f"{airport_name(topa.airport)} has the highest delayed-flight percentage in the current airport results ({topa.delay_rate:.2f}%). This is a descriptive ranking, not proof of a cause.")
+    st.caption("Metrics are calculated from the exported MapReduce results. Delay-cause totals represent accumulated attributed minutes.")
+
+elif page=="Carrier Analysis":
+    st.markdown("<div class='section-kicker'>AIRLINE RELIABILITY</div>",unsafe_allow_html=True)
+    sort=st.radio("View",["Highest average delay","Lowest average delay"],horizontal=True)
+    data=carrier.sort_values("average_delay",ascending=sort.startswith("Lowest"))
+    a,b=st.columns(2); a.metric("Carriers analysed",len(data)); b.metric("Total valid flight records",f"{int(data['count'].sum()):,}")
+    f=px.bar(data,x="average_delay",y="carrier",orientation="h",color="average_delay",text_auto=".2f",labels={"average_delay":"Average arrival delay (min)","carrier":"Carrier"})
+    st.plotly_chart(style_fig(f,480),width="stretch")
+    st.dataframe(data.rename(columns={"carrier":"Carrier","average_delay":"Average delay (min)","count":"Flights analysed"}),width="stretch",hide_index=True)
+    st.download_button("↓  Export carrier analysis",data.to_csv(index=False),"carrier_analysis.csv","text/csv")
+
+elif page=="Airport Analysis":
+    st.markdown("<div class='section-kicker'>AIRPORT LEADERBOARD</div>",unsafe_allow_html=True)
+    merged=airport.merge(rate,on="airport",how="inner")
+    merged["Airport"]=merged.airport.map(airport_name)
+    x,y,z=st.columns([1,1,1.2])
+    with x: minimum=st.slider("Minimum flights",100,10000,1000,100)
+    with y: metric=st.selectbox("Rank by",["average_delay","delay_rate"],format_func=lambda v:"Average delay" if v=="average_delay" else "Delayed-flight rate")
+    with z: direction=st.selectbox("Ranking",["Highest","Lowest"])
+    filtered=merged[merged.total>=minimum]
+    if filtered.empty: st.warning("No airports meet this threshold. Reduce the minimum-flight setting.")
+    else:
+        top=filtered.nsmallest(10,metric) if direction=="Lowest" else filtered.nlargest(10,metric)
+        label="Average delay (minutes)" if metric=="average_delay" else "Delayed flights (%)"
+        f=px.bar(top.sort_values(metric),x=metric,y="Airport",orientation="h",color=metric,text_auto=".2f",labels={metric:label})
+        st.plotly_chart(style_fig(f,500),width="stretch")
+        show=filtered[["Airport","airport","average_delay","delay_rate","delayed","total"]].rename(columns={"Airport":"Airport name","airport":"IATA code","average_delay":"Average delay (min)","delay_rate":"Delayed flights (%)","delayed":"Delayed flights","total":"Flights analysed"})
+        st.dataframe(show.sort_values(label if label in show else "Average delay (min)",ascending=False),width="stretch",hide_index=True)
+        st.download_button("↓  Export airport analysis",show.to_csv(index=False),"airport_analysis.csv","text/csv")
+
+elif page=="Delay Causes":
+    st.markdown("<div class='section-kicker'>WHY FLIGHTS ARE DELAYED</div>",unsafe_allow_html=True)
+    c=causes.copy(); c["Cause"]=c.cause.str.replace("_"," ").str.title(); c["Share (%)"]=c.minutes/c.minutes.sum()*100
+    l,r=st.columns([1.1,1])
+    with l:
+        f=px.bar(c.sort_values("minutes"),x="minutes",y="Cause",orientation="h",color="Share (%)",text_auto=".2s",labels={"minutes":"Accumulated delay minutes"})
+        st.plotly_chart(style_fig(f,400),width="stretch")
+    with r:
+        f=px.pie(c,names="Cause",values="minutes",hole=.55)
+        f.update_traces(textinfo="percent")
+        st.plotly_chart(style_fig(f,400),width="stretch")
+    st.markdown("### Explore an airport")
+    codes=sorted(airport_causes.airport.dropna().unique())
+    code=st.selectbox("Airport",codes,format_func=airport_name)
+    selected=airport_causes[airport_causes.airport==code].copy(); selected["Cause"]=selected.cause.str.replace("_"," ").str.title()
+    f=px.bar(selected,x="Cause",y="minutes",color="Cause",text_auto=".2s",labels={"minutes":"Accumulated delay minutes"},title=airport_name(code))
+    st.plotly_chart(style_fig(f,350),width="stretch")
+    st.caption("Cause totals are accumulated minutes recorded in the source data; larger airports may naturally have larger totals.")
+
+elif page=="Smart Insights":
+    st.markdown("<div class='section-kicker'>AUTOMATED FINDINGS FROM MAPREDUCE OUTPUTS</div>",unsafe_allow_html=True)
+    best=carrier.loc[carrier.average_delay.idxmin()]; worst=carrier.loc[carrier.average_delay.idxmax()]
+    wa=airport.loc[airport.average_delay.idxmax()]; wr=rate.loc[rate.delay_rate.idxmax()]
+    cause=causes.loc[causes.minutes.idxmax()]
+    late=airport_causes[airport_causes.cause=="LATE_AIRCRAFT_DELAY"]
+    c1,c2,c3=st.columns(3)
+    c1.metric("Highest-delay carrier",worst.carrier,f"{worst.average_delay:.2f} min")
+    c2.metric("Lowest-delay carrier",best.carrier,f"{best.average_delay:.2f} min")
+    c3.metric("Largest cause category",cause.cause.replace("_"," ").title(),f"{cause.minutes:,.0f} min")
+    c1,c2,c3=st.columns(3)
+    c1.metric("Highest avg-delay airport",wa.airport,f"{wa.average_delay:.2f} min",help=airport_name(wa.airport))
+    c2.metric("Highest delayed-flight rate",wr.airport,f"{wr.delay_rate:.2f}%",help=airport_name(wr.airport))
+    if not late.empty:
+        wlate=late.loc[late.minutes.idxmax()]; c3.metric("Highest late-aircraft total",wlate.airport,f"{wlate.minutes:,.0f} min",help=airport_name(wlate.airport))
+    st.markdown("### Findings")
+    st.info(f"{worst.carrier} has the highest average arrival delay among analysed carriers ({worst.average_delay:.2f} minutes).")
+    st.info(f"{airport_name(wa.airport)} has the highest average arrival delay in the airport results ({wa.average_delay:.2f} minutes).")
+    st.info(f"{airport_name(wr.airport)} has the highest delayed-flight rate ({wr.delay_rate:.2f}%).")
+    st.info(f"{cause.cause.replace('_',' ').title()} contributes the largest accumulated cause total ({cause.minutes:,.0f} minutes).")
+    comparison=airport.merge(rate,on="airport",how="inner")
+    common=set(comparison.nlargest(10,"average_delay").airport)&set(comparison.nlargest(10,"delay_rate").airport)
+    overlap=comparison[comparison.airport.isin(common)].copy(); overlap["Airport name"]=overlap.airport.map(airport_name)
+    st.markdown("### Airports appearing in both top-10 rankings")
+    if overlap.empty: st.write("No overlap found in the current top-10 rankings.")
+    else: st.dataframe(overlap[["Airport name","airport","average_delay","delay_rate","total"]].rename(columns={"airport":"IATA code","average_delay":"Average delay (min)","delay_rate":"Delayed flights (%)","total":"Flights analysed"}),width="stretch",hide_index=True)
+    st.download_button("↓  Download insights report",overlap.to_csv(index=False),"smart_insights.csv","text/csv")
+
+elif page=="Airport Comparison":
+    st.markdown("<div class='section-kicker'>SIDE-BY-SIDE AIRPORT INTELLIGENCE</div>",unsafe_allow_html=True)
+    codes=sorted(set(airport.airport)&set(rate.airport))
+    a,b=st.columns(2)
+    with a: code1=st.selectbox("First airport",codes,format_func=airport_name,key="modern_airport_1")
+    with b: code2=st.selectbox("Second airport",codes,index=min(1,len(codes)-1),format_func=airport_name,key="modern_airport_2")
+    if code1==code2: st.warning("Choose two different airports to compare.")
+    else:
+        av1=airport[airport.airport==code1].iloc[0]; av2=airport[airport.airport==code2].iloc[0]
+        rt1=rate[rate.airport==code1].iloc[0]; rt2=rate[rate.airport==code2].iloc[0]
+        st.markdown("### Performance snapshot")
+        c1,c2=st.columns(2)
+        with c1:
+            st.subheader(airport_name(code1)); st.metric("Average arrival delay",f"{av1.average_delay:.2f} min"); st.metric("Delayed-flight rate",f"{rt1.delay_rate:.2f}%"); st.metric("Flights analysed",f"{int(av1['count']):,}")
+        with c2:
+            st.subheader(airport_name(code2)); st.metric("Average arrival delay",f"{av2.average_delay:.2f} min"); st.metric("Delayed-flight rate",f"{rt2.delay_rate:.2f}%"); st.metric("Flights analysed",f"{int(av2['count']):,}")
+        compare=pd.DataFrame({"Airport":[airport_name(code1),airport_name(code2)],"Average delay (min)":[av1.average_delay,av2.average_delay],"Delayed flights (%)":[rt1.delay_rate,rt2.delay_rate]})
+        f=px.bar(compare.melt(id_vars="Airport",var_name="Metric",value_name="Value"),x="Metric",y="Value",color="Airport",barmode="group",text_auto=".2f")
+        st.plotly_chart(style_fig(f,380),width="stretch")
+        ac=airport_causes[airport_causes.airport.isin([code1,code2])].copy(); ac["Airport"]=ac.airport.map(airport_name); ac["Cause"]=ac.cause.str.replace("_"," ").str.title()
+        st.markdown("### Accumulated delay causes")
+        f=px.bar(ac,x="Cause",y="minutes",color="Airport",barmode="group",labels={"minutes":"Accumulated delay minutes"})
+        st.plotly_chart(style_fig(f,380),width="stretch")
+        st.caption("Comparison is descriptive. Accumulated cause minutes are not normalized by flight volume.")
+
+
+elif page=="Monthly Trend Analysis":
+    st.markdown("<div class='section-kicker'>MONTH-BY-MONTH FLIGHT OPERATIONS</div>",unsafe_allow_html=True)
+    if monthly.empty:
+        st.warning("Monthly trend results were not found. Export the Hadoop output to results/monthly-trends.txt and rerun the dashboard.")
+    else:
+        best_month = monthly.loc[monthly.average_delay.idxmin()]
+        worst_month = monthly.loc[monthly.average_delay.idxmax()]
+        rate_month = monthly.loc[monthly.delay_rate.idxmax()]
+        total_monthly_flights = int(monthly.flights.sum())
+        k1,k2,k3,k4 = st.columns(4)
+        k1.metric("Months analysed", len(monthly))
+        k2.metric("Flights with valid arrival delay", f"{total_monthly_flights:,}")
+        k3.metric("Highest average delay", f"{worst_month.average_delay:.2f} min", str(worst_month.month_label))
+        k4.metric("Lowest average delay", f"{best_month.average_delay:.2f} min", str(best_month.month_label))
+
+        st.markdown("### Average arrival delay by month")
+        f=px.line(monthly,x="month_label",y="average_delay",markers=True,text="average_delay",labels={"month_label":"Month","average_delay":"Average arrival delay (minutes)"})
+        f.update_traces(texttemplate="%{text:.2f}",textposition="top center",line=dict(width=3))
+        st.plotly_chart(style_fig(f,400),width="stretch")
+
+        left,right=st.columns(2)
+        with left:
+            st.markdown("### Delayed-flight percentage")
+            f=px.bar(monthly,x="month_label",y="delay_rate",text_auto=".2f",labels={"month_label":"Month","delay_rate":"Flights delayed >15 min (%)"})
+            st.plotly_chart(style_fig(f,360),width="stretch")
+        with right:
+            st.markdown("### Monthly flight volume")
+            f=px.bar(monthly,x="month_label",y="flights",text_auto=".2s",labels={"month_label":"Month","flights":"Valid arrival-delay records"})
+            st.plotly_chart(style_fig(f,360),width="stretch")
+
+        st.markdown("### Monthly performance table")
+        display=monthly[["month_label","average_delay","flights","delayed","delay_rate"]].rename(columns={"month_label":"Month","average_delay":"Average arrival delay (min)","flights":"Valid flights","delayed":"Delayed flights (>15 min)","delay_rate":"Delayed flights (%)"})
+        st.dataframe(display,width="stretch",hide_index=True)
+        st.download_button("↓  Export monthly trend report",display.to_csv(index=False),"monthly_flight_delay_trends.csv","text/csv")
+        st.info(f"{worst_month.month_label} recorded the highest average arrival delay ({worst_month.average_delay:.2f} minutes), while {best_month.month_label} recorded the lowest ({best_month.average_delay:.2f} minutes). {rate_month.month_label} had the highest delayed-flight percentage ({rate_month.delay_rate:.2f}%).")
+        st.caption("Monthly averages use records with a valid ARR_DELAY. A delayed flight is defined here as ARR_DELAY greater than 15 minutes.")
+
+
+elif page=="Route Analysis":
+    st.markdown("<div class='section-kicker'>ORIGIN–DESTINATION PERFORMANCE</div>",unsafe_allow_html=True)
+    if routes.empty:
+        st.warning("Route results are not loaded yet. Export the Hadoop output to results/route-analysis.txt, then refresh the dashboard.")
+    else:
+        minimum = st.slider("Minimum flights per route", 10, 500, 50, 10)
+        metric = st.selectbox("Rank routes by", ["average_delay", "delay_rate"],
+                              format_func=lambda x: "Average arrival delay" if x == "average_delay" else "Delayed-flight rate")
+        direction = st.radio("Ranking", ["Highest", "Lowest"], horizontal=True)
+        filtered = routes[routes.flights >= minimum].copy()
+        if filtered.empty:
+            st.warning("No routes meet this minimum-flight threshold. Reduce the threshold.")
+        else:
+            ranked = filtered.nlargest(15, metric) if direction == "Highest" else filtered.nsmallest(15, metric)
+            first, second, third = st.columns(3)
+            first.metric("Routes meeting threshold", f"{len(filtered):,}")
+            second.metric("Highest average delay", f"{filtered.average_delay.max():.2f} min")
+            third.metric("Highest delayed-flight rate", f"{filtered.delay_rate.max():.2f}%")
+            label = "Average arrival delay (minutes)" if metric == "average_delay" else "Delayed flights (%)"
+            fig = px.bar(ranked.sort_values(metric), x=metric, y="route", orientation="h",
+                         color=metric, text_auto=".2f", labels={metric: label, "route": "Route"})
+            st.plotly_chart(style_fig(fig, 520), width="stretch")
+
+            st.markdown("### Interactive route network")
+            st.caption("Airport locations come from the latitude/longitude fields in your airport reference file. Lines show selected origin–destination routes; hover for route statistics.")
+            map_count = st.slider("Routes to display on map", 10, 100, 40, 10)
+            map_metric = st.selectbox(
+                "Colour routes by",
+                ["average_delay", "delay_rate"],
+                format_func=lambda x: "Average arrival delay (min)" if x == "average_delay" else "Delayed-flight rate (%)",
+                key="route_map_metric"
+            )
+            map_routes = filtered.nlargest(map_count, "flights").copy()
+            map_routes[["origin", "destination"]] = map_routes["route"].str.split("-", n=1, expand=True)
+            coords = airport_coordinates.rename(columns={
+                "iata_code": "code", "airport_name": "name",
+                "latitude": "lat", "longitude": "lon"
+            })
+            map_routes = map_routes.merge(
+                coords[["code", "name", "lat", "lon"]].rename(
+                    columns={"code": "origin", "name": "origin_name", "lat": "origin_lat", "lon": "origin_lon"}),
+                on="origin", how="inner"
+            ).merge(
+                coords[["code", "name", "lat", "lon"]].rename(
+                    columns={"code": "destination", "name": "destination_name", "lat": "destination_lat", "lon": "destination_lon"}),
+                on="destination", how="inner"
+            )
+            if map_routes.empty:
+                st.warning("No routes could be matched to airport coordinates. Check the IATA codes in the airport reference file.")
+            else:
+                fig_map = px.scatter_geo(
+                    map_routes,
+                    lat="origin_lat", lon="origin_lon",
+                    color=map_metric, size="flights",
+                    hover_name="route",
+                    hover_data={
+                        "origin_name": True, "destination_name": True,
+                        "average_delay": ":.2f", "delay_rate": ":.2f",
+                        "flights": True, "delayed": True,
+                        "origin_lat": False, "origin_lon": False
+                    },
+                    projection="natural earth",
+                    labels={"average_delay": "Avg delay (min)", "delay_rate": "Delay rate (%)",
+                            "flights": "Flights", "delayed": "Delayed flights"}
+                )
+                # Draw each origin-destination connection as a geographic line.
+                for row in map_routes.itertuples(index=False):
+                    fig_map.add_trace(px.line_geo(
+                        pd.DataFrame({"lon": [row.origin_lon, row.destination_lon],
+                                      "lat": [row.origin_lat, row.destination_lat]}),
+                        lat="lat", lon="lon"
+                    ).data[0])
+                fig_map.update_geos(
+                    showcountries=True, countrycolor="rgba(148,163,184,.35)",
+                    showland=True, landcolor="rgba(30,41,59,.75)",
+                    showocean=True, oceancolor="rgba(8,13,24,.9)",
+                    showcoastlines=True, coastlinecolor="rgba(148,163,184,.25)"
+                )
+                fig_map.update_layout(showlegend=False)
+                st.plotly_chart(style_fig(fig_map, 560), width="stretch")
+
+            display = filtered[["route", "average_delay", "flights", "delayed", "delay_rate"]].rename(
+                columns={"route": "Route", "average_delay": "Average delay (min)", "flights": "Flights analysed",
+                         "delayed": "Delayed flights (>15 min)", "delay_rate": "Delayed flights (%)"})
+            st.markdown("### Route performance table")
+            st.dataframe(display.sort_values("Average delay (min)", ascending=False), width="stretch", hide_index=True)
+            st.download_button("↓  Export route analysis", display.to_csv(index=False), "route_analysis.csv", "text/csv")
+            st.caption("Route metrics use records with a valid arrival delay. Routes below the selected flight-count threshold are excluded from the ranking.")
+
+elif page=="Cancellation & Diversion":
+    st.markdown("<div class='section-kicker'>CARRIER OPERATIONAL DISRUPTIONS</div>",unsafe_allow_html=True)
+    if cancellation.empty:
+        st.warning("Cancellation/diversion results are not loaded yet. Export the Hadoop output to results/cancellation-diversion.txt, then refresh the dashboard.")
+    else:
+        by = st.radio("Compare carriers by", ["Cancellation rate", "Diversion rate"], horizontal=True)
+        metric = "cancellation_rate" if by == "Cancellation rate" else "diversion_rate"
+        rate_label = "Cancellation rate (%)" if metric == "cancellation_rate" else "Diversion rate (%)"
+        highest = cancellation.loc[cancellation[metric].idxmax()]
+        lowest = cancellation.loc[cancellation[metric].idxmin()]
+        total_flights = int(cancellation.flights.sum())
+        total_cancelled = int(cancellation.cancelled.sum())
+        total_diverted = int(cancellation.diverted.sum())
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("Flights counted", f"{total_flights:,}")
+        k2.metric("Cancelled flights", f"{total_cancelled:,}", f"{total_cancelled / total_flights * 100:.2f}%" if total_flights else None)
+        k3.metric("Diverted flights", f"{total_diverted:,}", f"{total_diverted / total_flights * 100:.2f}%" if total_flights else None)
+        k4.metric(f"Highest {by.lower()}", highest.carrier, f"{highest[metric]:.2f}%")
+        left, right = st.columns(2)
+        with left:
+            st.markdown(f"### Carrier {by.lower()} comparison")
+            fig = px.bar(cancellation.sort_values(metric), x=metric, y="carrier", orientation="h",
+                         color=metric, text_auto=".2f", labels={metric: rate_label, "carrier": "Carrier"})
+            st.plotly_chart(style_fig(fig, 420), width="stretch")
+        with right:
+            st.markdown("### Cancellation and diversion counts")
+            counts = cancellation.melt(id_vars="carrier", value_vars=["cancelled", "diverted"],
+                                       var_name="Disruption type", value_name="Flights")
+            counts["Disruption type"] = counts["Disruption type"].map({"cancelled": "Cancelled", "diverted": "Diverted"})
+            fig = px.bar(counts, x="carrier", y="Flights", color="Disruption type", barmode="group")
+            st.plotly_chart(style_fig(fig, 420), width="stretch")
+        display = cancellation.rename(columns={"carrier": "Carrier", "flights": "Total flights",
+            "cancelled": "Cancelled flights", "cancellation_rate": "Cancellation rate (%)",
+            "diverted": "Diverted flights", "diversion_rate": "Diversion rate (%)"})
+        st.markdown("### Carrier disruption table")
+        st.dataframe(display, width="stretch", hide_index=True)
+        st.download_button("↓  Export cancellation & diversion report", display.to_csv(index=False),
+                           "cancellation_diversion_analysis.csv", "text/csv")
+        st.info(f"{highest.carrier} has the highest {by.lower()} ({highest[metric]:.2f}%), while "
+                f"{lowest.carrier} has the lowest ({lowest[metric]:.2f}%).")
+        st.caption("Rates are calculated per carrier using the flight-status flags in the input dataset. Cancellation and diversion are reported separately.")
+
+st.divider()
+st.markdown("<div style='display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;color:#8392aa;font-size:12px'><span>FLIGHTSCOPE · FLIGHT DELAY INTELLIGENCE</span><span>Powered by Hadoop HDFS · Java MapReduce · YARN · Streamlit</span></div>",unsafe_allow_html=True)
+
